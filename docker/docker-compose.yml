@@ -1,0 +1,129 @@
+
+x-backend-env: &backend-env
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_USER: meetmemo
+  DB_PASSWORD: ${DB_PASSWORD:-meetmemo}
+  DB_NAME: meetmemo
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3001,http://10.65.37.235:3001}
+  STORAGE_PATH: /data/uploads
+  LDAP_ENABLED: ${LDAP_ENABLED:-false}
+  OIDC_ENABLED: ${OIDC_ENABLED:-false}
+  LLM_PROVIDER: ${LLM_PROVIDER:-litellm}
+  LLM_MODEL: ${LLM_MODEL:-vllm/deepseek-v4-flash}
+  LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+  LLM_PROXY_URL: ${LLM_PROXY_URL:-http://host.docker.internal:4000}
+  LLM_API_KEY: ${LLM_API_KEY:-sk-1234}
+  MODEL_DOWNLOAD_SOURCE: ${MODEL_DOWNLOAD_SOURCE:-modelscope}
+  HF_TOKEN: ${HF_TOKEN:-}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: meetmemo
+      POSTGRES_USER: meetmemo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-meetmemo}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meetmemo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *backend-env
+      DEBUG: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - upload_data:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    environment:
+      <<: *backend-env
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      ASR_PROVIDER: ${ASR_PROVIDER:-faster-whisper}
+      SENSEVOICE_MODE: ${SENSEVOICE_MODE:-local}
+      SENSEVOICE_API_URL: ${SENSEVOICE_API_URL:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      DIARIZE_PROVIDER: ${DIARIZE_PROVIDER:-local}
+      DIARIZE_API_URL: ${DIARIZE_API_URL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - upload_data:/data/uploads
+      - ml_cache:/root/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+    ports:
+      - "3001:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower:2.0
+    ports:
+      - "5555:5555"
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      FLOWER_PORT: 5555
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  upload_data:
+  ml_cache:

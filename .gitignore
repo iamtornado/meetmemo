@@ -1,0 +1,52 @@
+# --- Large audio / data files ---
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flac
+*.aac
+*.ogg
+*.webm
+data/uploads/
+
+# --- Secrets ---
+.env
+*.env.local
+*.env.production
+
+# --- Python cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Node ---
+node_modules/
+.next/
+
+# --- Claude AI session files ---
+.claude/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Docker volumes ---
+postgres_data/
+redis_data/

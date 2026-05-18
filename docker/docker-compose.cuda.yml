@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  worker:
+    runtime: nvidia
+    environment:
+      - WHISPER_DEVICE=cuda
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
