@@ -5,6 +5,8 @@ import logging
 from app.tasks.celery_app import celery_app
 from app.tasks.transcriber.base import TranscriptionResult
 from app.tasks.transcriber.factory import get_transcriber
+from app.tasks.pipeline_helpers import notify_meeting
+from app.utils.punctuation import apply_punctuation_to_result
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +18,10 @@ def transcribe(self, preprocess_result: dict) -> dict:
     audio_path = preprocess_result["audio_path"]
 
     try:
+        notify_meeting(meeting_id, "pipeline_progress", {"step": "transcribe"})
         transcriber = get_transcriber()
         result: TranscriptionResult = transcriber.transcribe(audio_path)
+        result = apply_punctuation_to_result(result)
 
         logger.info(
             f"Transcription complete: {meeting_id}, "
@@ -28,6 +32,7 @@ def transcribe(self, preprocess_result: dict) -> dict:
         return {
             "meeting_id": meeting_id,
             "audio_path": audio_path,
+            "duration": preprocess_result.get("duration"),
             "language": result.language,
             "model_used": transcriber.get_model_name(),
             "segments": [

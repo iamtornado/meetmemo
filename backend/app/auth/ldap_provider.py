@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 import ldap3
+from ldap3.utils.conv import escape_filter_chars
 
 from app.auth.base import AuthProvider
 from app.config import settings
@@ -30,19 +31,40 @@ class LDAPProvider(AuthProvider):
                 logger.warning("LDAP bind failed")
                 return None
 
-            # Search for user
-            search_filter = settings.LDAP_USER_SEARCH_FILTER.format(identifier)
-            conn.search(
-                search_base=settings.LDAP_BASE_DN,
-                search_filter=search_filter,
-                attributes=["*"],
-            )
+            # Try multiple search strategies to find the user
+            # identifier could be sAMAccountName, userPrincipalName, or mail
+            search_filters = [
+                settings.LDAP_USER_SEARCH_FILTER.format(identifier),
+            ]
 
-            if len(conn.entries) == 0:
+            # If the identifier contains @, also try matching by mail
+            if "@" in identifier:
+                search_filters.insert(0, f"(mail={identifier})")
+                search_filters.insert(0, f"(userPrincipalName={identifier})")
+            else:
+                # Without @, also try appending the default domain
+                ldap_domain = settings.LDAP_DOMAIN
+                if ldap_domain:
+                    search_filters.insert(0, f"(userPrincipalName={identifier}@{ldap_domain})")
+                    search_filters.insert(0, f"(mail={identifier}@{ldap_domain})")
+
+            user_entry = None
+            for search_filter in search_filters:
+                conn.search(
+                    search_base=settings.LDAP_BASE_DN,
+                    search_filter=search_filter,
+                    attributes=["*"],
+                )
+                if len(conn.entries) > 0:
+                    user_entry = conn.entries[0]
+                    logger.info(f"Found user with filter: {search_filter}")
+                    break
+
+            if user_entry is None:
                 return None
 
-            user_dn = conn.entries[0].entry_dn
-            user_attrs = conn.entries[0].entry_attributes_as_dict
+            user_dn = user_entry.entry_dn
+            user_attrs = user_entry.entry_attributes_as_dict
 
             # Verify password by binding as the user
             user_conn = ldap3.Connection(server, user=user_dn, password=password)
@@ -74,7 +96,8 @@ class LDAPProvider(AuthProvider):
             if not conn.bind():
                 return []
 
-            group_filter = settings.LDAP_GROUP_MEMBER_FILTER.format(user_dn)
+            safe_dn = escape_filter_chars(user_dn)
+            group_filter = settings.LDAP_GROUP_MEMBER_FILTER.format(safe_dn)
             conn.search(
                 search_base=settings.LDAP_BASE_DN,
                 search_filter=f"(&(objectClass=group){group_filter})",

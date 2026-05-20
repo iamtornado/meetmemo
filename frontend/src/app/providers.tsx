@@ -52,7 +52,14 @@ function AuthProviderInner({ children }: { children: React.ReactNode }) {
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: "Login failed" }));
-      throw new Error(err.detail);
+      const detail = err.detail;
+      const message =
+        typeof detail === "string"
+          ? detail
+          : Array.isArray(detail)
+          ? detail.map((d: { msg?: string }) => d.msg).join(", ")
+          : "Login failed";
+      throw new Error(message);
     }
     const data = await res.json();
     setTokens(data.access_token, data.refresh_token);

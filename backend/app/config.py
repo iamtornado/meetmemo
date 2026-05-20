@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     LDAP_BIND_PASSWORD: str = ""
     LDAP_USER_SEARCH_FILTER: str = "(sAMAccountName={})"
     LDAP_GROUP_MEMBER_FILTER: str = "(member={})"
+    LDAP_DOMAIN: str = ""  # e.g. company.com — used when login id has no @
 
     # --- OIDC ---
     OIDC_ENABLED: bool = False
@@ -87,10 +88,17 @@ class Settings(BaseSettings):
     ASR_PROVIDER: Literal["faster-whisper", "sensevoice"] = "faster-whisper"
     SENSEVOICE_MODE: Literal["local", "remote"] = "local"
     SENSEVOICE_API_URL: str = ""
+    SENSEVOICE_CHUNK_SECONDS: int = 300  # remote ASR chunk size (avoid GPU OOM on long files)
+
+    # --- Post-processing ---
+    PUNCTUATION_ENABLED: bool = True
+    PUNCTUATION_MODEL: str = "ct-punc-c"  # FunASR Chinese punctuation restoration
 
     # --- Diarization Provider ---
     DIARIZE_PROVIDER: Literal["local", "remote"] = "local"
     DIARIZE_API_URL: str = ""
+    DIARIZE_MERGE_MIN_OVERLAP_SEC: float = 0.3
+    DIARIZE_MERGE_MIN_OVERLAP_RATIO: float = 0.05
 
     # --- LLM ---
     LLM_PROVIDER: Literal["ollama", "openai", "litellm"] = "ollama"

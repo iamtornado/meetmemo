@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.config import settings
 from app.tasks.celery_app import celery_app
+from app.tasks.pipeline_helpers import notify_meeting
 from app.utils.audio import extract_audio, get_audio_duration, normalize_audio
 
 logger = logging.getLogger(__name__)
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 def audio_preprocess(self, meeting_id: str, audio_path: str) -> dict:
     """Preprocess audio: extract, normalize, convert to 16kHz mono WAV."""
     try:
+        notify_meeting(meeting_id, "pipeline_progress", {"step": "preprocess"})
         input_path = Path(audio_path)
         if not input_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")

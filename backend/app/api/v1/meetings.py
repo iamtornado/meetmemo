@@ -124,7 +124,11 @@ async def process_meeting(
     if not meeting:
         raise NotFoundError("Meeting not found")
 
+    if meeting.status == "processing":
+        return {"message": "Already processing", "meeting_id": str(meeting_id)}
+
     from app.tasks.pipeline import run_meeting_pipeline
+
     run_meeting_pipeline.delay(
         str(meeting_id),
         whisper_model=body.whisper_model,

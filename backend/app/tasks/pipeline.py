@@ -24,7 +24,12 @@ from app.tasks.transcribe import transcribe
 from app.tasks.diarize import diarize
 from app.tasks.summarize import summarize
 from app.config import settings
-from app.services.notification_service import notification_manager
+from app.tasks.pipeline_helpers import (
+    check_remote_ml_services,
+    mark_meeting_failed,
+    mark_meeting_processing,
+    notify_meeting,
+)
 from app.utils.audio import get_audio_duration
 
 logger = logging.getLogger(__name__)
@@ -41,17 +46,19 @@ def run_meeting_pipeline(
     """Orchestrate the full meeting processing pipeline."""
     logger.info(f"Starting pipeline for meeting {meeting_id}")
 
+    remote_errors = check_remote_ml_services()
+    if remote_errors:
+        mark_meeting_failed(meeting_id, "; ".join(remote_errors), step="preflight")
+        return {"meeting_id": meeting_id, "status": "failed"}
+
     # Get meeting audio path using sync session (avoids async loop conflicts)
     with sync_session_factory() as session:
         meeting = session.query(Meeting).filter(Meeting.id == uuid.UUID(meeting_id)).first()
         if not meeting:
             raise ValueError(f"Meeting {meeting_id} not found")
-        meeting.status = "processing"
-        meeting.processing_started_at = datetime.now(timezone.utc)
-        session.flush()
-        session.commit()
         audio_path = meeting.audio_path
-    notification_manager.notify(meeting_id, "pipeline_started", {"meeting_id": meeting_id})
+
+    mark_meeting_processing(meeting_id)
 
     # Build task chain
     steps = [
@@ -69,7 +76,14 @@ def run_meeting_pipeline(
     steps.append(store_results.s())
 
     workflow = chain(*steps)
-    workflow.apply_async()
+    workflow.apply_async(link_error=on_pipeline_error.s(meeting_id))
+
+
+@celery_app.task
+def on_pipeline_error(meeting_id: str, request, exc, traceback):
+    """Celery errback: mark meeting failed when any pipeline step fails."""
+    step = getattr(request, "task", None) or getattr(request, "name", None) or "pipeline"
+    mark_meeting_failed(meeting_id, str(exc), step=step)
 
 
 @celery_app.task(bind=True)
@@ -101,6 +115,97 @@ def run_summarization(self, meeting_id: str):
     workflow.apply_async()
 
 
+def _replace_transcript_segments(
+    session: Session,
+    transcript: Transcript,
+    segments: list[dict],
+    *,
+    language: str | None,
+    model_used: str | None,
+    word_count: int,
+) -> None:
+    """Replace all segments on an existing transcript row."""
+    for seg in list(transcript.segments):
+        session.delete(seg)
+    session.flush()
+
+    if language:
+        transcript.language = language
+    if model_used:
+        transcript.model_used = model_used
+    transcript.word_count = word_count
+
+    for i, seg in enumerate(segments):
+        session.add(
+            TranscriptSegment(
+                transcript_id=transcript.id,
+                seq_number=i,
+                speaker_id=seg.get("speaker_id"),
+                speaker_name=None,
+                start_time=seg.get("start", 0),
+                end_time=seg.get("end", 0),
+                text=seg.get("text", ""),
+                confidence=seg.get("confidence"),
+            )
+        )
+
+
+def _populate_summary_children(session: Session, summary: Summary, summary_data: dict) -> None:
+    for a in list(summary.attendees):
+        session.delete(a)
+    for kp in list(summary.key_points):
+        session.delete(kp)
+    for d in list(summary.decisions):
+        session.delete(d)
+    for ai in list(summary.action_items):
+        session.delete(ai)
+    session.flush()
+
+    for a in summary_data.get("attendees", []):
+        name = a.get("name", "Unknown")
+        speaker_id = a.get("speaker_id")
+        if not speaker_id and isinstance(name, str) and name.startswith("SPEAKER_"):
+            speaker_id = name
+        session.add(
+            SummaryAttendee(
+                summary_id=summary.id,
+                speaker_id=speaker_id,
+                name=name,
+                is_guest=a.get("is_guest", False),
+            )
+        )
+    for kp in summary_data.get("key_points", []):
+        session.add(
+            SummaryKeyPoint(
+                summary_id=summary.id,
+                topic=kp.get("topic"),
+                description=kp.get("description", ""),
+                importance=kp.get("importance"),
+            )
+        )
+    for d in summary_data.get("decisions", []):
+        session.add(
+            SummaryDecision(
+                summary_id=summary.id,
+                description=d.get("description", ""),
+                made_by=d.get("made_by"),
+                consensus=d.get("consensus", True),
+            )
+        )
+    for ai in summary_data.get("action_items", []):
+        session.add(
+            SummaryActionItem(
+                summary_id=summary.id,
+                description=ai.get("description", ""),
+                assignee=ai.get("assignee"),
+                due_date=(
+                    datetime.fromisoformat(ai["due_date"]) if ai.get("due_date") else None
+                ),
+                status=ai.get("status", "pending"),
+            )
+        )
+
+
 @celery_app.task(bind=True)
 def store_results(self, pipeline_result: dict) -> dict:
     """Store pipeline results (transcript + summary) to database."""
@@ -113,105 +218,79 @@ def store_results(self, pipeline_result: dict) -> dict:
         if not meeting:
             raise ValueError(f"Meeting {meeting_id} not found")
 
-        # Store transcript
         segments = pipeline_result.get("segments", [])
         if segments:
-            transcript = Transcript(
-                meeting_id=meeting.id,
-                language=pipeline_result.get("language", "unknown"),
-                model_used=pipeline_result.get("model_used", "unknown"),
-                word_count=pipeline_result.get("word_count", 0),
+            existing = (
+                session.query(Transcript).filter(Transcript.meeting_id == meeting.id).first()
             )
-            session.add(transcript)
-            session.flush()
-
-            for i, seg in enumerate(segments):
-                tseg = TranscriptSegment(
-                    transcript_id=transcript.id,
-                    seq_number=i,
-                    speaker_id=seg.get("speaker_id"),
-                    speaker_name=None,
-                    start_time=seg.get("start", 0),
-                    end_time=seg.get("end", 0),
-                    text=seg.get("text", ""),
-                    confidence=seg.get("confidence"),
+            if existing:
+                _replace_transcript_segments(
+                    session,
+                    existing,
+                    segments,
+                    language=pipeline_result.get("language"),
+                    model_used=pipeline_result.get("model_used"),
+                    word_count=pipeline_result.get("word_count", 0),
                 )
-                session.add(tseg)
+            else:
+                transcript = Transcript(
+                    meeting_id=meeting.id,
+                    language=pipeline_result.get("language", "unknown"),
+                    model_used=pipeline_result.get("model_used", "unknown"),
+                    word_count=pipeline_result.get("word_count", 0),
+                )
+                session.add(transcript)
+                session.flush()
+                _replace_transcript_segments(
+                    session,
+                    transcript,
+                    segments,
+                    language=pipeline_result.get("language"),
+                    model_used=pipeline_result.get("model_used"),
+                    word_count=pipeline_result.get("word_count", 0),
+                )
 
-        # Store summary
         summary_data = pipeline_result.get("summary")
         if summary_data:
-            summary = Summary(
-                meeting_id=meeting.id,
-                model_used=f"llm/{pipeline_result.get('summary_model', settings.LLM_MODEL)}",
-                ai_title=summary_data.get("title"),
-                ai_date=(
-                    datetime.fromisoformat(summary_data["date"])
-                    if summary_data.get("date")
-                    else None
-                ),
-                next_agenda=summary_data.get("next_agenda"),
-                additional_notes=summary_data.get("additional_notes"),
+            model_used = f"llm/{pipeline_result.get('summary_model', settings.LLM_MODEL)}"
+            ai_date = (
+                datetime.fromisoformat(summary_data["date"])
+                if summary_data.get("date")
+                else None
             )
-            session.add(summary)
-            session.flush()
+            existing_summary = (
+                session.query(Summary).filter(Summary.meeting_id == meeting.id).first()
+            )
+            if existing_summary:
+                existing_summary.model_used = model_used
+                existing_summary.ai_title = summary_data.get("title")
+                existing_summary.ai_date = ai_date
+                existing_summary.next_agenda = summary_data.get("next_agenda")
+                existing_summary.additional_notes = summary_data.get("additional_notes")
+                existing_summary.updated_at = datetime.now(timezone.utc)
+                _populate_summary_children(session, existing_summary, summary_data)
+            else:
+                summary = Summary(
+                    meeting_id=meeting.id,
+                    model_used=model_used,
+                    ai_title=summary_data.get("title"),
+                    ai_date=ai_date,
+                    next_agenda=summary_data.get("next_agenda"),
+                    additional_notes=summary_data.get("additional_notes"),
+                )
+                session.add(summary)
+                session.flush()
+                _populate_summary_children(session, summary, summary_data)
 
-            # Attendees
-            for a in summary_data.get("attendees", []):
-                session.add(SummaryAttendee(
-                    summary_id=summary.id,
-                    name=a.get("name", "Unknown"),
-                    is_guest=a.get("is_guest", False),
-                ))
-
-            # Key points
-            for kp in summary_data.get("key_points", []):
-                session.add(SummaryKeyPoint(
-                    summary_id=summary.id,
-                    topic=kp.get("topic"),
-                    description=kp.get("description", ""),
-                    importance=kp.get("importance"),
-                ))
-
-            # Decisions
-            for d in summary_data.get("decisions", []):
-                session.add(SummaryDecision(
-                    summary_id=summary.id,
-                    description=d.get("description", ""),
-                    made_by=d.get("made_by"),
-                    consensus=d.get("consensus", True),
-                ))
-
-            # Action items
-            for ai in summary_data.get("action_items", []):
-                session.add(SummaryActionItem(
-                    summary_id=summary.id,
-                    description=ai.get("description", ""),
-                    assignee=ai.get("assignee"),
-                    due_date=(
-                        datetime.fromisoformat(ai["due_date"])
-                        if ai.get("due_date")
-                        else None
-                    ),
-                    status=ai.get("status", "pending"),
-                ))
-
-        # Update meeting status
         meeting.status = "completed"
         meeting.processing_completed_at = datetime.now(timezone.utc)
 
-        # Update duration if available
         if pipeline_result.get("duration"):
             meeting.duration_seconds = int(pipeline_result["duration"])
 
         session.commit()
 
-    # Notify via SSE
-    notification_manager.notify(
-        meeting_id,
-        "pipeline_completed",
-        {"meeting_id": meeting_id, "status": "completed"},
-    )
+    notify_meeting(meeting_id, "pipeline_completed", {"status": "completed"})
 
     logger.info(f"Pipeline results stored for meeting {meeting_id}")
     return {"meeting_id": meeting_id, "status": "completed"}

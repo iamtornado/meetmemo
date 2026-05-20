@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMeetingEvents } from "@/hooks/useMeetingEvents";
 import { AppShell } from "@/components/layout/AppShell";
 import { TranscriptViewer } from "@/components/transcript/TranscriptViewer";
 import { SummaryPanel } from "@/components/summary/SummaryPanel";
@@ -41,6 +42,31 @@ export default function MeetingDetailPage() {
 
   const [processing, setProcessing] = useState(false);
   const [processError, setProcessError] = useState("");
+  const [progressStep, setProgressStep] = useState<string | null>(null);
+
+  const handlePipelineEvent = useCallback(
+    (data: { type: string; step?: string }) => {
+      if (data.type === "pipeline_progress" && data.step) {
+        setProgressStep(data.step);
+      }
+      if (
+        data.type === "pipeline_completed" ||
+        data.type === "pipeline_failed"
+      ) {
+        setProgressStep(null);
+        queryClient.invalidateQueries({ queryKey: ["meeting", meetingId] });
+        queryClient.invalidateQueries({ queryKey: ["transcript", meetingId] });
+        queryClient.invalidateQueries({ queryKey: ["summary", meetingId] });
+      }
+    },
+    [meetingId, queryClient]
+  );
+
+  useMeetingEvents(
+    meetingId,
+    meeting?.status === "processing",
+    handlePipelineEvent
+  );
 
   const handleProcess = async () => {
     setProcessing(true);
@@ -79,6 +105,7 @@ export default function MeetingDetailPage() {
   const handleSpeakerRename = async (mappings: Record<string, string>) => {
     await api.renameSpeakers(meetingId, mappings);
     queryClient.invalidateQueries({ queryKey: ["transcript", meetingId] });
+    queryClient.invalidateQueries({ queryKey: ["summary", meetingId] });
   };
 
   if (isLoading) return <AppShell><PageLoading /></AppShell>;
@@ -116,16 +143,22 @@ export default function MeetingDetailPage() {
               </div>
             </div>
 
-            {meeting.status === "uploaded" && (
+            {(meeting.status === "uploaded" || meeting.status === "failed") && (
               <Button onClick={handleProcess} disabled={processing} loading={processing}>
                 <Play className="h-4 w-4 mr-2" />
-                {processing ? "Starting..." : "Process"}
+                {processing
+                  ? "Starting..."
+                  : meeting.status === "failed"
+                  ? "Retry"
+                  : "Process"}
               </Button>
             )}
 
             {meeting.status === "processing" && (
               <Button disabled loading>
-                Processing...
+                {progressStep
+                  ? `Processing (${progressStep})...`
+                  : "Processing..."}
               </Button>
             )}
 

@@ -5,6 +5,8 @@ import logging
 from app.tasks.celery_app import celery_app
 from app.tasks.diarizer.base import DiarizationResult
 from app.tasks.diarizer.factory import get_diarizer
+from app.tasks.pipeline_helpers import notify_meeting
+from app.utils.speaker_merge import merge_diarization_with_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +27,12 @@ def diarize(self, transcribe_result: dict) -> dict:
     segments = transcribe_result.get("segments", [])
 
     try:
+        notify_meeting(meeting_id, "pipeline_progress", {"step": "diarize"})
         diarizer = get_diarizer()
         result: DiarizationResult = diarizer.diarize(audio_path)
 
         # Merge diarization with transcript segments
-        merged = _merge_diarization(segments, result.speaker_segments)
+        merged = merge_diarization_with_transcript(segments, result.speaker_segments)
 
         logger.info(
             f"Diarization complete: {meeting_id}, "
@@ -62,33 +65,3 @@ def diarize(self, transcribe_result: dict) -> dict:
         }
 
 
-def _merge_diarization(segments: list[dict], speaker_segments: list[dict]) -> list[dict]:
-    """Merge diarization speaker labels into transcript segments by time overlap."""
-    if not speaker_segments:
-        return [{**s, "speaker_id": None} for s in segments]
-
-    merged = []
-    for seg in segments:
-        seg_start = seg["start"]
-        seg_end = seg["end"]
-        seg_duration = seg_end - seg_start
-
-        best_speaker = None
-        best_overlap = 0
-
-        for sp in speaker_segments:
-            overlap_start = max(seg_start, sp["start"])
-            overlap_end = min(seg_end, sp["end"])
-            overlap = max(0, overlap_end - overlap_start)
-
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = sp["speaker"]
-
-        # Only assign speaker if overlap is significant (>20%)
-        if best_overlap < seg_duration * 0.2:
-            best_speaker = None
-
-        merged.append({**seg, "speaker_id": best_speaker})
-
-    return merged

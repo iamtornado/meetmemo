@@ -1,4 +1,5 @@
 import type {
+  AuthGroupMapping,
   Meeting,
   MeetingListResponse,
   Transcript,
@@ -207,4 +208,21 @@ export const api = {
     request<void>(`/admin/users/${userId}/role?role=${role}`, { method: "PUT" }),
   adminGetStats: () =>
     request<{ total_users: number; total_meetings: number }>("/admin/stats"),
+  adminListAuthMappings: () =>
+    request<AuthGroupMapping[]>("/admin/auth/mappings"),
+  adminCreateAuthMapping: (data: {
+    auth_provider?: string;
+    group_name: string;
+    mapped_role: string;
+  }) =>
+    request<AuthGroupMapping>("/admin/auth/mappings", {
+      method: "POST",
+      body: JSON.stringify({
+        auth_provider: data.auth_provider ?? "ldap",
+        group_name: data.group_name,
+        mapped_role: data.mapped_role,
+      }),
+    }),
+  adminDeleteAuthMapping: (id: string) =>
+    request<void>(`/admin/auth/mappings/${id}`, { method: "DELETE" }),
 };

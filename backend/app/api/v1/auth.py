@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_session
-from app.api.errors import ConflictError
+from app.api.errors import AuthError, ConflictError
 from app.models.user import User
 from app.schemas.user import (
     ChangePassword,
@@ -42,6 +42,20 @@ async def register(body: UserCreate, session: AsyncSession = Depends(get_session
 @router.post("/login", response_model=TokenResponse)
 async def login(body: UserLogin, session: AsyncSession = Depends(get_session)):
     auth_service = AuthService(session)
+
+    # First check if this is an AD user
+    from app.auth.ldap_provider import ldap_provider
+    if ldap_provider.enabled:
+        # Try LDAP authentication first (AD users auto-create local account)
+        try:
+            user = await auth_service.authenticate_ldap(body.email, body.password)
+            tokens = await auth_service.create_tokens(user)
+            return tokens
+        except AuthError:
+            # LDAP failed, fall through to local auth
+            pass
+
+    # Fall back to local authentication
     user = await auth_service.authenticate(body.email, body.password)
     tokens = await auth_service.create_tokens(user)
     return tokens

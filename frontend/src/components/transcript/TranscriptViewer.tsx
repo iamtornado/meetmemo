@@ -28,8 +28,24 @@ export function TranscriptViewer({
     }
   });
 
+  const openRenameDialog = () => {
+    const initial: Record<string, string> = {};
+    speakers.forEach((name, id) => {
+      initial[id] = name;
+    });
+    setRenameMappings(initial);
+    setShowRename(true);
+  };
+
   const handleRename = () => {
-    onSpeakerRename?.(renameMappings);
+    const payload: Record<string, string> = {};
+    speakers.forEach((_, id) => {
+      const name = (renameMappings[id] ?? "").trim();
+      if (name) {
+        payload[id] = name;
+      }
+    });
+    onSpeakerRename?.(payload);
     setShowRename(false);
   };
 
@@ -62,9 +78,9 @@ export function TranscriptViewer({
         <div className="text-sm text-gray-500">
           {transcript.word_count} words · {transcript.language}
         </div>
-        {speakers.size > 0 && (
-          <Button variant="outline" size="sm" onClick={() => setShowRename(true)}>
-            Rename Speakers
+        {speakers.size > 0 && onSpeakerRename && (
+          <Button variant="outline" size="sm" onClick={openRenameDialog}>
+            编辑说话人姓名
           </Button>
         )}
       </div>
@@ -100,15 +116,18 @@ export function TranscriptViewer({
       <Dialog
         open={showRename}
         onClose={() => setShowRename(false)}
-        title="Rename Speakers"
+        title="编辑说话人姓名"
       >
         <div className="space-y-3">
+          <p className="text-sm text-gray-500">
+            系统标签（如 SPEAKER_01）可改为真实姓名，转写与摘要参会人将同步更新。
+          </p>
           {Array.from(speakers.entries()).map(([id, name]) => (
             <div key={id} className="flex items-center gap-2">
-              <span className="text-sm font-medium w-24 text-gray-600">{id}:</span>
+              <span className="text-sm font-medium w-28 text-gray-600 shrink-0">{id}</span>
               <Input
-                defaultValue={name}
-                placeholder="Enter name"
+                value={renameMappings[id] ?? name}
+                placeholder="输入姓名"
                 onChange={(e) =>
                   setRenameMappings((prev) => ({ ...prev, [id]: e.target.value }))
                 }
@@ -116,7 +135,7 @@ export function TranscriptViewer({
             </div>
           ))}
           <Button className="w-full" onClick={handleRename}>
-            Apply Names
+            保存
           </Button>
         </div>
       </Dialog>

@@ -131,3 +131,12 @@ export interface SearchResponse {
   page: number;
   page_size: number;
 }
+
+export interface AuthGroupMapping {
+  id: string;
+  auth_provider: string;
+  group_name: string;
+  mapped_role: string;
+  team_id: string | null;
+  created_at: string;
+}

@@ -10,15 +10,7 @@ x-backend-env: &backend-env
   SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
   CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3001,http://10.65.37.235:3001}
   STORAGE_PATH: /data/uploads
-  LDAP_ENABLED: ${LDAP_ENABLED:-false}
-  OIDC_ENABLED: ${OIDC_ENABLED:-false}
-  LLM_PROVIDER: ${LLM_PROVIDER:-litellm}
-  LLM_MODEL: ${LLM_MODEL:-vllm/deepseek-v4-flash}
-  LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
-  LLM_PROXY_URL: ${LLM_PROXY_URL:-http://host.docker.internal:4000}
-  LLM_API_KEY: ${LLM_API_KEY:-sk-1234}
-  MODEL_DOWNLOAD_SOURCE: ${MODEL_DOWNLOAD_SOURCE:-modelscope}
-  HF_TOKEN: ${HF_TOKEN:-}
+  # LDAP, OIDC, LLM, ASR, DIARIZE — loaded from env_file (../.env), not overridden here
 
 services:
   postgres:
@@ -55,6 +47,7 @@ services:
     build:
       context: ../backend
       dockerfile: Dockerfile
+    env_file: ../.env
     ports:
       - "8000:8000"
     environment:
@@ -75,16 +68,9 @@ services:
     build:
       context: ..
       dockerfile: worker/Dockerfile
+    env_file: ../.env
     environment:
       <<: *backend-env
-      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
-      WHISPER_MODEL: ${WHISPER_MODEL:-base}
-      ASR_PROVIDER: ${ASR_PROVIDER:-faster-whisper}
-      SENSEVOICE_MODE: ${SENSEVOICE_MODE:-local}
-      SENSEVOICE_API_URL: ${SENSEVOICE_API_URL:-}
-      HF_TOKEN: ${HF_TOKEN:-}
-      DIARIZE_PROVIDER: ${DIARIZE_PROVIDER:-local}
-      DIARIZE_API_URL: ${DIARIZE_API_URL:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

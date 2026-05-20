@@ -246,60 +246,156 @@ class SenseVoiceProvider(BaseTranscriber):
 class SenseVoiceRemoteProvider(BaseTranscriber):
     """Transcription provider using SenseVoice via remote HTTP API.
 
-    Useful when SenseVoice is deployed on a GPU server.
-    Expects an OpenAI-compatible API or a simple POST audio → text endpoint.
-
-    Configure via SENSEVOICE_API_URL environment variable.
+    Long audio is split into fixed-duration chunks before upload so the remote
+    GPU is not asked to transcribe an entire meeting in one request (OOM).
     """
 
     def __init__(self):
         self._api_url = settings.SENSEVOICE_API_URL.rstrip("/")
+        self._chunk_seconds = max(60, int(settings.SENSEVOICE_CHUNK_SECONDS))
 
     def get_model_name(self) -> str:
-        return f"sensevoice/remote"
+        return "sensevoice/remote"
 
     def transcribe(self, audio_path: str) -> TranscriptionResult:
-        """Send audio file to remote SenseVoice API for transcription."""
+        from app.utils.audio import get_audio_duration
+
+        duration = get_audio_duration(audio_path)
+        if duration <= self._chunk_seconds:
+            logger.info(
+                f"SenseVoiceRemote: single request ({duration:.0f}s) → {self._api_url}"
+            )
+            return self._parse_api_response(
+                self._post_audio(audio_path),
+                time_offset=0.0,
+                chunk_duration=duration,
+            )
+
+        logger.info(
+            f"SenseVoiceRemote: chunked transcribe {duration:.0f}s "
+            f"in {self._chunk_seconds}s slices → {self._api_url}"
+        )
+        return self._transcribe_chunked(audio_path, duration)
+
+    def _transcribe_chunked(self, audio_path: str, duration: float) -> TranscriptionResult:
+        import os
+        import subprocess
+        import tempfile
+
+        all_segments: list[TranscriptionSegment] = []
+        language = "unknown"
+        offset = 0.0
+        chunk_idx = 0
+
+        while offset < duration:
+            chunk_len = min(self._chunk_seconds, duration - offset)
+            chunk_idx += 1
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-ss", str(offset),
+                        "-t", str(chunk_len),
+                        "-i", audio_path,
+                        "-ar", "16000", "-ac", "1",
+                        tmp_path,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+
+                logger.info(
+                    f"SenseVoiceRemote: chunk {chunk_idx} "
+                    f"{offset:.0f}s–{offset + chunk_len:.0f}s"
+                )
+                data = self._post_audio(tmp_path)
+                part = self._parse_api_response(
+                    data,
+                    time_offset=offset,
+                    chunk_duration=chunk_len,
+                )
+                if part.language != "unknown":
+                    language = part.language
+                all_segments.extend(part.segments)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+            offset += self._chunk_seconds
+
+        word_count = sum(len(s.text.split()) for s in all_segments if s.text)
+        logger.info(
+            f"SenseVoiceRemote: done, {chunk_idx} chunks, "
+            f"{word_count} words, {len(all_segments)} segments"
+        )
+        return TranscriptionResult(
+            segments=all_segments,
+            language=language,
+            word_count=word_count,
+        )
+
+    def _post_audio(self, audio_path: str) -> dict:
+        import os
+
         import httpx
 
-        logger.info(f"SenseVoiceRemote: sending {audio_path} to {self._api_url}")
-
         with open(audio_path, "rb") as f:
-            files = {"audio": f}
             response = httpx.post(
                 f"{self._api_url}/transcribe",
-                files=files,
-                timeout=httpx.Timeout(1800.0, connect=30.0),
+                files={"audio": (os.path.basename(audio_path), f, "audio/wav")},
+                timeout=httpx.Timeout(600.0, connect=30.0),
             )
             response.raise_for_status()
-            data = response.json()
+            return response.json()
 
-        return self._parse_api_response(data)
-
-    def _parse_api_response(self, data: dict) -> TranscriptionResult:
-        """Parse remote API response into TranscriptionResult.
-
-        Expected API response format:
-        {
-            "segments": [{"start": 0.0, "end": 2.5, "text": "你好"}],
-            "language": "zh",
-            "word_count": 10
-        }
-        """
+    def _parse_api_response(
+        self,
+        data: dict,
+        time_offset: float = 0.0,
+        chunk_duration: float | None = None,
+    ) -> TranscriptionResult:
+        """Parse remote API JSON; apply time_offset for chunked transcription."""
         segments_raw = data.get("segments", [])
-        segments = [
-            TranscriptionSegment(
-                start=s.get("start", 0.0),
-                end=s.get("end", 0.0),
-                text=s.get("text", ""),
-                confidence=s.get("confidence"),
+        if not segments_raw and data.get("text"):
+            segments_raw = [{"start": 0.0, "end": 0.0, "text": data["text"]}]
+
+        segments: list[TranscriptionSegment] = []
+        for s in segments_raw:
+            cleaned = SenseVoiceProvider._clean_sensevoice_text(s.get("text", ""))
+            if not cleaned:
+                continue
+
+            start = float(s.get("start", 0.0))
+            end = float(s.get("end", 0.0))
+            if start == 0.0 and end == 0.0 and chunk_duration is not None:
+                start = time_offset
+                end = time_offset + chunk_duration
+            else:
+                start += time_offset
+                end += time_offset
+                if end <= start:
+                    end = start + (chunk_duration or 1.0)
+
+            segments.append(
+                TranscriptionSegment(
+                    start=start,
+                    end=end,
+                    text=cleaned,
+                    confidence=s.get("confidence"),
+                )
             )
-            for s in segments_raw
-            if s.get("text", "").strip()
-        ]
+
+        language = data.get("language", "unknown")
+        word_count = sum(len(s.text.split()) for s in segments)
 
         return TranscriptionResult(
             segments=segments,
-            language=data.get("language", "unknown"),
-            word_count=data.get("word_count", sum(len(s.text.split()) for s in segments)),
+            language=language,
+            word_count=word_count or data.get("word_count", 0),
         )

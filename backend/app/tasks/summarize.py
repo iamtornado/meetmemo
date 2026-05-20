@@ -7,6 +7,7 @@ from typing import Any
 
 from app.config import settings
 from app.tasks.celery_app import celery_app
+from app.tasks.pipeline_helpers import notify_meeting
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ def summarize(self, diarize_result: dict) -> dict:
     segments = diarize_result.get("segments", [])
 
     try:
+        notify_meeting(meeting_id, "pipeline_progress", {"step": "summarize"})
         transcript_text = _format_transcript(segments)
         template = settings.SUMMARY_TEMPLATE or DEFAULT_SUMMARY_TEMPLATE
 
@@ -86,7 +88,17 @@ def summarize(self, diarize_result: dict) -> dict:
 
     except Exception as exc:
         logger.error(f"Summarization failed for {meeting_id}: {exc}")
-        raise self.retry(exc=exc, countdown=30)
+        # LLM unavailable — still complete pipeline with a minimal summary
+        summary_data = _build_fallback_summary(segments)
+        return {
+            "meeting_id": meeting_id,
+            "summary": summary_data,
+            "segments": segments,
+            "language": diarize_result.get("language"),
+            "word_count": diarize_result.get("word_count", 0),
+            "duration": diarize_result.get("duration"),
+            "summary_error": str(exc),
+        }
 
 
 def _call_llm(prompt: str) -> dict[str, Any]:

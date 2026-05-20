@@ -9,8 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import AuthError, ConflictError
 from app.config import settings
-from app.models.auth import RefreshToken
+from app.models.auth import AuthGroupMapping, RefreshToken
 from app.models.user import User
+
+_ROLE_PRIORITY = {"admin": 3, "editor": 2, "member": 1, "viewer": 1}
 from app.schemas.user import TokenResponse, UserResponse
 from app.auth.middleware import create_access_token, create_refresh_token
 
@@ -59,6 +61,83 @@ class AuthService:
             raise AuthError("Account is inactive")
 
         return user
+
+    async def authenticate_ldap(self, identifier: str, password: str) -> User:
+        """Authenticate via LDAP/AD. Auto-creates local user on first login."""
+        from app.auth.ldap_provider import ldap_provider
+
+        if not ldap_provider.enabled:
+            raise AuthError("LDAP authentication is not enabled")
+
+        user_info = await ldap_provider.authenticate(identifier, password)
+        if user_info is None:
+            raise AuthError("Invalid AD credentials")
+
+        # Look up existing user by auth_provider_id (DN) or email
+        dn = user_info["dn"]
+        email = user_info["mail"]
+        uid = user_info["uid"]
+
+        result = await self.session.execute(
+            select(User).where(
+                (User.auth_provider == "ldap") & (User.auth_provider_id == dn)
+            )
+        )
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            # Try matching by email as fallback
+            result = await self.session.execute(
+                select(User).where(User.email == email)
+            )
+            user = result.scalar_one_or_none()
+
+        mapped_role = await self._resolve_ldap_role(user_info.get("groups", []))
+
+        if user is not None:
+            user.auth_provider = "ldap"
+            user.auth_provider_id = dn
+            user.display_name = user_info.get("display_name", uid)
+            user.email = email
+            if mapped_role:
+                user.role = mapped_role
+        else:
+            user = User(
+                email=email,
+                password_hash=None,
+                display_name=user_info.get("display_name", uid),
+                role=mapped_role or "member",
+                auth_provider="ldap",
+                auth_provider_id=dn,
+            )
+            self.session.add(user)
+
+        await self.session.flush()
+
+        if not user.is_active:
+            raise AuthError("Account is inactive")
+
+        return user
+
+    async def _resolve_ldap_role(self, groups: list[str]) -> str | None:
+        """Map AD group memberships to MeetMemo role via admin-configured mappings."""
+        if not groups:
+            return None
+
+        result = await self.session.execute(
+            select(AuthGroupMapping).where(
+                AuthGroupMapping.auth_provider == "ldap",
+                AuthGroupMapping.group_name.in_(groups),
+            )
+        )
+        mappings = result.scalars().all()
+        if not mappings:
+            return None
+
+        return max(
+            mappings,
+            key=lambda m: _ROLE_PRIORITY.get(m.mapped_role, 0),
+        ).mapped_role
 
     async def create_tokens(self, user: User) -> TokenResponse:
         access_token = create_access_token(
