@@ -46,7 +46,15 @@ export function UploadDialog({
       recorder.start();
       setRecording(true);
     } catch (err) {
-      alert("Microphone access denied");
+      const isInsecure =
+        typeof window !== "undefined" &&
+        !window.isSecureContext &&
+        window.location.hostname !== "localhost";
+      const hint = isInsecure
+        ? "当前通过 HTTP 访问（如 http://10.x.x.x:3001），浏览器不允许使用麦克风。请改用「选择文件上传」，或通过 HTTPS / localhost 访问。"
+        : "请在浏览器地址栏允许麦克风权限，或检查系统/耳机麦克风是否可用。";
+      console.error("getUserMedia failed", err);
+      alert(`无法使用麦克风录音\n\n${hint}`);
     }
   };
 

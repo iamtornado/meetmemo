@@ -128,6 +128,10 @@ async def process_meeting(
         return {"message": "Already processing", "meeting_id": str(meeting_id)}
 
     from app.tasks.pipeline import run_meeting_pipeline
+    from app.tasks.pipeline_helpers import mark_meeting_processing
+
+    # Mark processing immediately so the UI updates without waiting for Celery worker pickup.
+    mark_meeting_processing(str(meeting_id))
 
     run_meeting_pipeline.delay(
         str(meeting_id),

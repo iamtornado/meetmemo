@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMeetingEvents } from "@/hooks/useMeetingEvents";
@@ -43,53 +43,87 @@ export default function MeetingDetailPage() {
   const [processing, setProcessing] = useState(false);
   const [processError, setProcessError] = useState("");
   const [progressStep, setProgressStep] = useState<string | null>(null);
+  const [pipelineActive, setPipelineActive] = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const isProcessing =
+    meeting?.status === "processing" || pipelineActive;
+
+  useEffect(() => {
+    if (meeting?.status === "processing") {
+      setPipelineActive(true);
+    }
+    if (meeting?.status === "completed" || meeting?.status === "failed") {
+      setPipelineActive(false);
+    }
+  }, [meeting?.status]);
+
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, []);
+
+  const refreshMeetingData = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ["meeting", meetingId] });
+    queryClient.invalidateQueries({ queryKey: ["transcript", meetingId] });
+    queryClient.invalidateQueries({ queryKey: ["summary", meetingId] });
+  }, [meetingId, queryClient]);
 
   const handlePipelineEvent = useCallback(
     (data: { type: string; step?: string }) => {
+      if (data.type === "pipeline_started") {
+        setPipelineActive(true);
+        setProgressStep(null);
+        refreshMeetingData();
+      }
       if (data.type === "pipeline_progress" && data.step) {
+        setPipelineActive(true);
         setProgressStep(data.step);
       }
-      if (
-        data.type === "pipeline_completed" ||
-        data.type === "pipeline_failed"
-      ) {
+      if (data.type === "pipeline_completed" || data.type === "pipeline_failed") {
+        setPipelineActive(false);
         setProgressStep(null);
-        queryClient.invalidateQueries({ queryKey: ["meeting", meetingId] });
-        queryClient.invalidateQueries({ queryKey: ["transcript", meetingId] });
-        queryClient.invalidateQueries({ queryKey: ["summary", meetingId] });
+        refreshMeetingData();
       }
     },
-    [meetingId, queryClient]
+    [refreshMeetingData]
   );
 
-  useMeetingEvents(
-    meetingId,
-    meeting?.status === "processing",
-    handlePipelineEvent
-  );
+  useMeetingEvents(meetingId, isProcessing, handlePipelineEvent);
+
+  const startPolling = useCallback(() => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const m = await api.getMeeting(meetingId);
+        queryClient.setQueryData(["meeting", meetingId], m);
+        if (m.status === "processing") {
+          setPipelineActive(true);
+        }
+        if (m.status === "completed" || m.status === "failed") {
+          if (pollRef.current) clearInterval(pollRef.current);
+          pollRef.current = null;
+          setPipelineActive(false);
+          refreshMeetingData();
+        }
+      } catch {
+        /* ignore transient poll errors */
+      }
+    }, 2000);
+  }, [meetingId, queryClient, refreshMeetingData]);
 
   const handleProcess = async () => {
     setProcessing(true);
     setProcessError("");
+    setPipelineActive(true);
     try {
       await api.processMeeting(meetingId);
-      queryClient.invalidateQueries({ queryKey: ["meeting", meetingId] });
-      // Poll for completion
-      const poll = setInterval(async () => {
-        try {
-          const m = await api.getMeeting(meetingId);
-          if (m.status === "completed" || m.status === "failed") {
-            clearInterval(poll);
-            queryClient.invalidateQueries({ queryKey: ["meeting", meetingId] });
-            queryClient.invalidateQueries({ queryKey: ["transcript", meetingId] });
-            queryClient.invalidateQueries({ queryKey: ["summary", meetingId] });
-          }
-        } catch {
-          // polling error, ignore
-        }
-      }, 3000);
+      await queryClient.refetchQueries({ queryKey: ["meeting", meetingId] });
+      startPolling();
     } catch (err: unknown) {
       setProcessError(err instanceof Error ? err.message : "Process failed");
+      setPipelineActive(false);
     } finally {
       setProcessing(false);
     }
@@ -143,7 +177,8 @@ export default function MeetingDetailPage() {
               </div>
             </div>
 
-            {(meeting.status === "uploaded" || meeting.status === "failed") && (
+            {(meeting.status === "uploaded" || meeting.status === "failed") &&
+              !isProcessing && (
               <Button onClick={handleProcess} disabled={processing} loading={processing}>
                 <Play className="h-4 w-4 mr-2" />
                 {processing
@@ -154,7 +189,7 @@ export default function MeetingDetailPage() {
               </Button>
             )}
 
-            {meeting.status === "processing" && (
+            {isProcessing && (
               <Button disabled loading>
                 {progressStep
                   ? `Processing (${progressStep})...`
@@ -180,7 +215,7 @@ export default function MeetingDetailPage() {
             />
           ) : (
             <div className="text-center py-12 text-gray-500">
-              {meeting.status === "processing"
+              {isProcessing
                 ? "Transcription in progress..."
                 : meeting.status === "uploaded"
                 ? "Click Process to start transcription"
@@ -197,7 +232,7 @@ export default function MeetingDetailPage() {
             />
           ) : (
             <div className="text-center py-12 text-gray-500">
-              {meeting.status === "processing"
+              {isProcessing
                 ? "Summary generation in progress..."
                 : meeting.status === "uploaded"
                 ? "Click Process to generate summary"

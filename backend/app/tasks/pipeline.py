@@ -57,8 +57,10 @@ def run_meeting_pipeline(
         if not meeting:
             raise ValueError(f"Meeting {meeting_id} not found")
         audio_path = meeting.audio_path
+        already_processing = meeting.status == "processing"
 
-    mark_meeting_processing(meeting_id)
+    if not already_processing:
+        mark_meeting_processing(meeting_id)
 
     # Build task chain
     steps = [
@@ -79,9 +81,28 @@ def run_meeting_pipeline(
     workflow.apply_async(link_error=on_pipeline_error.s(meeting_id))
 
 
+def _meeting_id_from_errback_request(request) -> str:
+    """Resolve meeting_id from Celery errback request (signature is request, exc, traceback)."""
+    if request.args:
+        first = request.args[0]
+        if isinstance(first, str) and len(first) >= 32:
+            return first
+        if isinstance(first, dict) and first.get("meeting_id"):
+            return str(first["meeting_id"])
+    kwargs = getattr(request, "kwargs", None) or {}
+    if kwargs.get("meeting_id"):
+        return str(kwargs["meeting_id"])
+    raise ValueError("Cannot resolve meeting_id from errback request")
+
+
 @celery_app.task
-def on_pipeline_error(meeting_id: str, request, exc, traceback):
+def on_pipeline_error(request, exc, traceback):
     """Celery errback: mark meeting failed when any pipeline step fails."""
+    try:
+        meeting_id = _meeting_id_from_errback_request(request)
+    except ValueError:
+        logger.exception("Pipeline errback could not resolve meeting_id")
+        return
     step = getattr(request, "task", None) or getattr(request, "name", None) or "pipeline"
     mark_meeting_failed(meeting_id, str(exc), step=step)
 
@@ -107,9 +128,15 @@ def run_summarization(self, meeting_id: str):
             for s in transcript.segments
         ]
 
-    # Chain summarize → store_results so the result gets persisted
+    # Chain summarize → store_results (summary only — do not rewrite transcript rows)
     workflow = chain(
-        summarize.s({"meeting_id": meeting_id, "segments": segments}),
+        summarize.s(
+            {
+                "meeting_id": meeting_id,
+                "segments": segments,
+                "summary_only": True,
+            }
+        ),
         store_results.s(),
     )
     workflow.apply_async()
@@ -219,7 +246,7 @@ def store_results(self, pipeline_result: dict) -> dict:
             raise ValueError(f"Meeting {meeting_id} not found")
 
         segments = pipeline_result.get("segments", [])
-        if segments:
+        if segments and not pipeline_result.get("summary_only"):
             existing = (
                 session.query(Transcript).filter(Transcript.meeting_id == meeting.id).first()
             )

@@ -88,7 +88,8 @@ class Settings(BaseSettings):
     ASR_PROVIDER: Literal["faster-whisper", "sensevoice"] = "faster-whisper"
     SENSEVOICE_MODE: Literal["local", "remote"] = "local"
     SENSEVOICE_API_URL: str = ""
-    SENSEVOICE_CHUNK_SECONDS: int = 300  # remote ASR chunk size (avoid GPU OOM on long files)
+    SENSEVOICE_CHUNK_SECONDS: int = 3600  # client-side fallback slice when remote /health has no VAD
+    SENSEVOICE_REQUEST_TIMEOUT_MAX: int = 7200  # HTTP timeout cap for single VAD transcribe request
 
     # --- Post-processing ---
     PUNCTUATION_ENABLED: bool = True
@@ -107,6 +108,9 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "http://localhost:11434/v1"
     LLM_PROXY_URL: str = ""  # LiteLLM proxy URL, e.g. "http://litellm:4000"
     SUMMARY_TEMPLATE: str = ""
+    # Single-pass summarization uses up to SUMMARY_MAX_CHUNK_CHARS; above SUMMARY_MAP_REDUCE_THRESHOLD use map-reduce.
+    SUMMARY_MAX_CHUNK_CHARS: int = 10000
+    SUMMARY_MAP_REDUCE_THRESHOLD: int = 12000
 
     # --- Celery ---
     CELERY_BROKER_URL: str = ""

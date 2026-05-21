@@ -38,6 +38,41 @@ Generate a JSON response with exactly this structure:
 }}
 """
 
+MAP_CHUNK_TEMPLATE = """You are summarizing part {part} of {total} of a long meeting transcript.
+Extract only facts stated in THIS portion. Output valid JSON with this structure (use empty arrays/strings when none):
+{{
+    "title": "short topic for this portion or empty string",
+    "date": null,
+    "attendees": [{{"name": "...", "is_guest": false}}],
+    "key_points": [{{"topic": "...", "description": "...", "importance": 3}}],
+    "decisions": [{{"description": "...", "made_by": "...", "consensus": true}}],
+    "action_items": [{{"description": "...", "assignee": "...", "status": "pending"}}],
+    "next_agenda": "",
+    "additional_notes": "..."
+}}
+
+Transcript portion:
+{transcript}
+"""
+
+REDUCE_TEMPLATE = """You are merging {count} partial summaries of the SAME meeting into one final structured summary.
+Deduplicate overlapping points, combine action items and decisions, and write a coherent overall title.
+Output valid JSON with exactly this structure:
+{{
+    "title": "A concise meeting title",
+    "date": "Meeting date if mentioned, otherwise null",
+    "attendees": [{{"name": "...", "is_guest": false}}],
+    "key_points": [{{"topic": "...", "description": "...", "importance": 3}}],
+    "decisions": [{{"description": "...", "made_by": "...", "consensus": true}}],
+    "action_items": [{{"description": "...", "assignee": "...", "status": "pending"}}],
+    "next_agenda": "Topics for next meeting",
+    "additional_notes": "Any other relevant information"
+}}
+
+Partial summaries (JSON array):
+{partials}
+"""
+
 
 @celery_app.task(bind=True, max_retries=2)
 def summarize(self, diarize_result: dict) -> dict:
@@ -47,40 +82,18 @@ def summarize(self, diarize_result: dict) -> dict:
 
     try:
         notify_meeting(meeting_id, "pipeline_progress", {"step": "summarize"})
-        transcript_text = _format_transcript(segments)
         template = settings.SUMMARY_TEMPLATE or DEFAULT_SUMMARY_TEMPLATE
 
-        # Truncate transcript to fit within context window (16k tokens ≈ ~20k chars for Chinese)
-        # Reserve ~2k chars for template + output
-        max_transcript_chars = 12000
-        if len(transcript_text) > max_transcript_chars:
-            logger.warning(
-                f"Transcript too long ({len(transcript_text)} chars), "
-                f"truncating to {max_transcript_chars}"
-            )
-            transcript_text = transcript_text[:max_transcript_chars] + "\n... [transcript truncated]"
-
-        prompt = template.replace("{transcript}", transcript_text)
-
-        summary_data = _call_llm(prompt)
-
-        # If LLM returned empty dict, try without response_format
-        if not summary_data or summary_data == {}:
-            logger.warning("LLM returned empty summary, retrying without response_format")
-            summary_data = _call_llm_fallback(prompt)
-
-        # If still empty, build a minimal summary from the transcript
-        if not summary_data or summary_data == {}:
-            logger.warning("Using fallback summary from transcript")
-            summary_data = _build_fallback_summary(segments)
+        summary_data = _summarize_transcript(segments, template)
 
         logger.info(f"Summary generated: {meeting_id}")
 
-        # Pass through segments from diarize result for store_results
+        out_segments = [] if diarize_result.get("summary_only") else segments
         return {
             "meeting_id": meeting_id,
             "summary": summary_data,
-            "segments": segments,
+            "segments": out_segments,
+            "summary_only": bool(diarize_result.get("summary_only")),
             "language": diarize_result.get("language"),
             "word_count": diarize_result.get("word_count", 0),
             "duration": diarize_result.get("duration"),
@@ -88,12 +101,12 @@ def summarize(self, diarize_result: dict) -> dict:
 
     except Exception as exc:
         logger.error(f"Summarization failed for {meeting_id}: {exc}")
-        # LLM unavailable — still complete pipeline with a minimal summary
         summary_data = _build_fallback_summary(segments)
         return {
             "meeting_id": meeting_id,
             "summary": summary_data,
-            "segments": segments,
+            "segments": [] if diarize_result.get("summary_only") else segments,
+            "summary_only": bool(diarize_result.get("summary_only")),
             "language": diarize_result.get("language"),
             "word_count": diarize_result.get("word_count", 0),
             "duration": diarize_result.get("duration"),
@@ -101,28 +114,165 @@ def summarize(self, diarize_result: dict) -> dict:
         }
 
 
+def _summarize_transcript(segments: list[dict], template: str) -> dict[str, Any]:
+    """Summarize full transcript; map-reduce when longer than threshold."""
+    transcript_text = _format_transcript(segments)
+    threshold = max(2000, int(settings.SUMMARY_MAP_REDUCE_THRESHOLD))
+    chunk_size = max(4000, int(settings.SUMMARY_MAX_CHUNK_CHARS))
+
+    if len(transcript_text) <= threshold:
+        prompt = template.replace("{transcript}", transcript_text)
+        summary_data = _call_llm(prompt)
+        if not summary_data:
+            summary_data = _call_llm_fallback(prompt)
+        if not summary_data:
+            summary_data = _build_fallback_summary(segments)
+        return summary_data
+
+    logger.info(
+        f"Transcript {len(transcript_text)} chars > {threshold}, using map-reduce summarization"
+    )
+    return _summarize_map_reduce(segments, chunk_size)
+
+
+def _summarize_map_reduce(segments: list[dict], chunk_size: int) -> dict[str, Any]:
+    chunks = _chunk_segments(segments, chunk_size)
+    partials: list[dict[str, Any]] = []
+
+    for i, chunk_text in enumerate(chunks, start=1):
+        prompt = MAP_CHUNK_TEMPLATE.format(
+            part=i, total=len(chunks), transcript=chunk_text
+        )
+        part = _call_llm(prompt)
+        if not part:
+            part = _call_llm_fallback(prompt)
+        if part:
+            partials.append(part)
+            logger.info(f"Map summary part {i}/{len(chunks)}: {len(part.get('key_points', []))} key_points")
+        else:
+            logger.warning(f"Map summary part {i}/{len(chunks)} returned empty")
+
+    if not partials:
+        return _build_fallback_summary(segments)
+
+    if len(partials) == 1:
+        return _normalize_summary(partials[0])
+
+    merged = _reduce_summaries_llm(partials)
+    if merged:
+        return _normalize_summary(merged)
+
+    logger.warning("Reduce step failed, merging partial summaries heuristically")
+    return _merge_summaries_heuristic(partials)
+
+
+def _reduce_summaries_llm(partials: list[dict[str, Any]]) -> dict[str, Any]:
+    prompt = REDUCE_TEMPLATE.format(
+        count=len(partials),
+        partials=json.dumps(partials, ensure_ascii=False, indent=2),
+    )
+    merged = _call_llm(prompt)
+    if not merged:
+        merged = _call_llm_fallback(prompt)
+    return merged or {}
+
+
+def _merge_summaries_heuristic(partials: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fallback merge when reduce LLM call fails."""
+    title = ""
+    date = None
+    attendees: dict[str, dict] = {}
+    key_points: list[dict] = []
+    decisions: list[dict] = []
+    action_items: list[dict] = []
+    next_agendas: list[str] = []
+    notes: list[str] = []
+
+    for p in partials:
+        if not title and p.get("title"):
+            title = str(p["title"])
+        if p.get("date") and not date:
+            date = p.get("date")
+        for a in p.get("attendees") or []:
+            name = (a.get("name") or "").strip()
+            if name and name not in attendees:
+                attendees[name] = {"name": name, "is_guest": bool(a.get("is_guest", False))}
+        key_points.extend(p.get("key_points") or [])
+        decisions.extend(p.get("decisions") or [])
+        action_items.extend(p.get("action_items") or [])
+        na = (p.get("next_agenda") or "").strip()
+        if na:
+            next_agendas.append(na)
+        note = (p.get("additional_notes") or "").strip()
+        if note:
+            notes.append(note)
+
+    return _normalize_summary(
+        {
+            "title": title or "Meeting Summary",
+            "date": date,
+            "attendees": list(attendees.values()),
+            "key_points": key_points,
+            "decisions": decisions,
+            "action_items": action_items,
+            "next_agenda": next_agendas[-1] if next_agendas else "",
+            "additional_notes": " ".join(notes),
+        }
+    )
+
+
+def _normalize_summary(data: dict[str, Any]) -> dict[str, Any]:
+    """Ensure expected keys exist with sane defaults."""
+    return {
+        "title": data.get("title") or "",
+        "date": data.get("date"),
+        "attendees": data.get("attendees") or [],
+        "key_points": data.get("key_points") or [],
+        "decisions": data.get("decisions") or [],
+        "action_items": data.get("action_items") or [],
+        "next_agenda": data.get("next_agenda") or "",
+        "additional_notes": data.get("additional_notes") or "",
+    }
+
+
+def _chunk_segments(segments: list[dict], max_chars: int) -> list[str]:
+    """Split transcript into chunks at segment boundaries."""
+    chunks: list[str] = []
+    lines: list[str] = []
+    size = 0
+
+    def flush() -> None:
+        nonlocal lines, size
+        if lines:
+            chunks.append("\n".join(lines))
+        lines = []
+        size = 0
+
+    for seg in segments:
+        line = (
+            f"[{_format_time(seg.get('start', 0))}] "
+            f"{seg.get('speaker_id') or 'Unknown'}: {seg.get('text', '')}"
+        )
+        line_len = len(line) + 1
+        if size + line_len > max_chars and lines:
+            flush()
+        lines.append(line)
+        size += line_len
+
+    flush()
+    return chunks or [""]
+
+
 def _call_llm(prompt: str) -> dict[str, Any]:
     """Call LLM via LiteLLM proxy, with direct OpenAI/Ollama fallback."""
-    # Priority: LiteLLM proxy URL > direct provider
     proxy_url = getattr(settings, "LLM_PROXY_URL", "") or ""
 
     if proxy_url:
         return _call_via_litellm_proxy(prompt, proxy_url)
-    else:
-        return _call_direct(prompt)
+    return _call_direct(prompt)
 
 
 def _call_via_litellm_proxy(prompt: str, proxy_url: str) -> dict[str, Any]:
-    """Call LLM through a LiteLLM proxy server.
-
-    LiteLLM proxy exposes a single OpenAI-compatible endpoint that
-    routes to any provider (OpenAI, Claude, Gemini, Azure, Ollama, etc.).
-
-    Environment setup:
-        LLM_PROXY_URL=http://litellm:4000
-        LLM_API_KEY=sk-litellm-proxy-key
-        LLM_MODEL=openai/gpt-4o  (or claude-sonnet-4-20250514, gemini/gemini-2.0-flash, etc.)
-    """
     from openai import OpenAI
 
     client = OpenAI(
@@ -145,7 +295,6 @@ def _call_via_litellm_proxy(prompt: str, proxy_url: str) -> dict[str, Any]:
 
 
 def _call_direct(prompt: str) -> dict[str, Any]:
-    """Call LLM directly (Ollama or OpenAI-compatible endpoint)."""
     from openai import DefaultHttpxClient, OpenAI
     import httpx
 
@@ -172,7 +321,6 @@ def _call_direct(prompt: str) -> dict[str, Any]:
         },
     }
 
-    # response_format is not supported by all providers (Ollama older versions)
     try:
         kwargs["response_format"] = {"type": "json_object"}
     except Exception:
@@ -213,13 +361,11 @@ def _extract_json(text: str) -> str:
 
 def _call_llm_fallback(prompt: str) -> dict[str, Any]:
     """Call LLM without response_format parameter (for models that don't support it)."""
-    from openai import OpenAI
+    from openai import DefaultHttpxClient, OpenAI
+    import httpx
 
     api_key = settings.LLM_API_KEY or "ollama"
     base_url = settings.LLM_BASE_URL
-
-    from openai import DefaultHttpxClient
-    import httpx
 
     client = OpenAI(
         api_key=api_key,
@@ -243,7 +389,7 @@ def _call_llm_fallback(prompt: str) -> dict[str, Any]:
     content = response.choices[0].message.content
     try:
         parsed = json.loads(_extract_json(content or ""))
-        if parsed:  # Only return non-empty dicts
+        if parsed:
             return parsed
     except (json.JSONDecodeError, TypeError):
         pass
@@ -253,16 +399,17 @@ def _call_llm_fallback(prompt: str) -> dict[str, Any]:
 def _build_fallback_summary(segments: list[dict]) -> dict[str, Any]:
     """Build a basic summary from transcript segments when LLM is unavailable."""
     unique_speakers = set()
-    full_text = []
+    full_text: list[str] = []
     for seg in segments:
         speaker = seg.get("speaker_id") or "Unknown"
         unique_speakers.add(speaker)
-        full_text.append(seg.get("text", ""))
+        t = seg.get("text", "")
+        if t:
+            full_text.append(t)
 
-    transcript_text = " ".join(full_text)
-    words = transcript_text.split()
-    # Take first 200 words as description
-    description = " ".join(words[:200]) if words else ""
+    transcript_text = "".join(full_text)
+    char_count = len(transcript_text.replace(" ", ""))
+    description = transcript_text[:800] if transcript_text else ""
 
     return {
         "title": "",
@@ -272,5 +419,5 @@ def _build_fallback_summary(segments: list[dict]) -> dict[str, Any]:
         "decisions": [],
         "action_items": [],
         "next_agenda": "",
-        "additional_notes": f"Auto-generated summary ({len(words)} words, {len(unique_speakers)} speakers)",
+        "additional_notes": f"Auto-generated summary ({char_count} chars, {len(unique_speakers)} speakers)",
     }

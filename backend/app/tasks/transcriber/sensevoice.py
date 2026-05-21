@@ -6,6 +6,7 @@ from typing import Any
 
 from app.config import settings
 from app.tasks.transcriber.base import BaseTranscriber, TranscriptionResult, TranscriptionSegment
+from app.utils.transcript_segments import merge_to_sentence_level, needs_sentence_merge
 
 logger = logging.getLogger(__name__)
 
@@ -246,33 +247,62 @@ class SenseVoiceProvider(BaseTranscriber):
 class SenseVoiceRemoteProvider(BaseTranscriber):
     """Transcription provider using SenseVoice via remote HTTP API.
 
-    Long audio is split into fixed-duration chunks before upload so the remote
-    GPU is not asked to transcribe an entire meeting in one request (OOM).
+    When the remote server exposes VAD (``/health`` → ``vad_enabled: true``),
+    sends the full meeting audio in one request (official FunASR path).
+
+    Falls back to fixed-duration client slicing only for legacy servers without VAD.
     """
 
     def __init__(self):
         self._api_url = settings.SENSEVOICE_API_URL.rstrip("/")
         self._chunk_seconds = max(60, int(settings.SENSEVOICE_CHUNK_SECONDS))
+        self._timeout_max = max(600, int(settings.SENSEVOICE_REQUEST_TIMEOUT_MAX))
+        self._remote_vad: bool | None = None
 
     def get_model_name(self) -> str:
         return "sensevoice/remote"
+
+    def _remote_has_vad(self) -> bool:
+        if self._remote_vad is not None:
+            return self._remote_vad
+        import httpx
+
+        try:
+            r = httpx.get(f"{self._api_url}/health", timeout=httpx.Timeout(10.0, connect=5.0))
+            r.raise_for_status()
+            self._remote_vad = bool(r.json().get("vad_enabled"))
+        except Exception as exc:
+            logger.warning(f"SenseVoiceRemote: health check failed, assume no VAD: {exc}")
+            self._remote_vad = False
+        return self._remote_vad
 
     def transcribe(self, audio_path: str) -> TranscriptionResult:
         from app.utils.audio import get_audio_duration
 
         duration = get_audio_duration(audio_path)
-        if duration <= self._chunk_seconds:
+
+        if self._remote_has_vad():
             logger.info(
-                f"SenseVoiceRemote: single request ({duration:.0f}s) → {self._api_url}"
+                f"SenseVoiceRemote: VAD single request ({duration:.0f}s) → {self._api_url}"
             )
             return self._parse_api_response(
-                self._post_audio(audio_path),
+                self._post_audio(audio_path, duration_seconds=duration),
+                time_offset=0.0,
+                chunk_duration=duration,
+            )
+
+        if duration <= self._chunk_seconds:
+            logger.info(
+                f"SenseVoiceRemote: legacy single request ({duration:.0f}s) → {self._api_url}"
+            )
+            return self._parse_api_response(
+                self._post_audio(audio_path, duration_seconds=duration),
                 time_offset=0.0,
                 chunk_duration=duration,
             )
 
         logger.info(
-            f"SenseVoiceRemote: chunked transcribe {duration:.0f}s "
+            f"SenseVoiceRemote: legacy chunked transcribe {duration:.0f}s "
             f"in {self._chunk_seconds}s slices → {self._api_url}"
         )
         return self._transcribe_chunked(audio_path, duration)
@@ -312,7 +342,7 @@ class SenseVoiceRemoteProvider(BaseTranscriber):
                     f"SenseVoiceRemote: chunk {chunk_idx} "
                     f"{offset:.0f}s–{offset + chunk_len:.0f}s"
                 )
-                data = self._post_audio(tmp_path)
+                data = self._post_audio(tmp_path, duration_seconds=chunk_len)
                 part = self._parse_api_response(
                     data,
                     time_offset=offset,
@@ -340,16 +370,24 @@ class SenseVoiceRemoteProvider(BaseTranscriber):
             word_count=word_count,
         )
 
-    def _post_audio(self, audio_path: str) -> dict:
+    def _post_audio(self, audio_path: str, *, duration_seconds: float | None = None) -> dict:
         import os
 
         import httpx
+
+        read_timeout = 600.0
+        if duration_seconds is not None:
+            # VAD long audio: ~0.3–1.0× realtime; generous cap for GPU load
+            read_timeout = min(
+                self._timeout_max,
+                max(600.0, duration_seconds * 1.5 + 120.0),
+            )
 
         with open(audio_path, "rb") as f:
             response = httpx.post(
                 f"{self._api_url}/transcribe",
                 files={"audio": (os.path.basename(audio_path), f, "audio/wav")},
-                timeout=httpx.Timeout(600.0, connect=30.0),
+                timeout=httpx.Timeout(read_timeout, connect=30.0),
             )
             response.raise_for_status()
             return response.json()
@@ -365,7 +403,7 @@ class SenseVoiceRemoteProvider(BaseTranscriber):
         if not segments_raw and data.get("text"):
             segments_raw = [{"start": 0.0, "end": 0.0, "text": data["text"]}]
 
-        segments: list[TranscriptionSegment] = []
+        parsed_raw: list[dict] = []
         for s in segments_raw:
             cleaned = SenseVoiceProvider._clean_sensevoice_text(s.get("text", ""))
             if not cleaned:
@@ -382,20 +420,34 @@ class SenseVoiceRemoteProvider(BaseTranscriber):
                 if end <= start:
                     end = start + (chunk_duration or 1.0)
 
+            parsed_raw.append(
+                {"start": start, "end": end, "text": cleaned, "confidence": s.get("confidence")}
+            )
+
+        if needs_sentence_merge(parsed_raw):
+            merged = merge_to_sentence_level(parsed_raw, max_duration_sec=15.0)
+            logger.info(
+                f"SenseVoiceRemote: merged {len(parsed_raw)} micro-segments → {len(merged)} sentences"
+            )
+            parsed_raw = merged
+
+        segments: list[TranscriptionSegment] = []
+        for s in parsed_raw:
             segments.append(
                 TranscriptionSegment(
-                    start=start,
-                    end=end,
-                    text=cleaned,
+                    start=float(s["start"]),
+                    end=float(s["end"]),
+                    text=s["text"],
                     confidence=s.get("confidence"),
                 )
             )
 
         language = data.get("language", "unknown")
-        word_count = sum(len(s.text.split()) for s in segments)
+        # Chinese transcripts rarely use spaces; prefer API char count or glyph count
+        word_count = data.get("word_count") or sum(len(s.text) for s in segments)
 
         return TranscriptionResult(
             segments=segments,
             language=language,
-            word_count=word_count or data.get("word_count", 0),
+            word_count=word_count,
         )

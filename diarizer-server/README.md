@@ -1,122 +1,80 @@
 # Diarizer Server — Remote pyannote.audio API
 
-A standalone FastAPI server that runs pyannote speaker diarization on a remote
-machine and exposes an HTTP API for the MeetMemo worker to call.
+Standalone FastAPI server for speaker diarization. MeetMemo calls it when `DIARIZE_PROVIDER=remote`.
 
-## Quick Start
+## Quick Start (GPU host)
 
 ```bash
-# 1. Install dependencies
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-pip install pyannote.audio fastapi uvicorn python-multipart httpx modelscope
+cd /data/diarizer-server
 
-# 2. Download models from ModelScope (preferred in China)
-#    Models are stored in /data/models/pyannote/
+pip install torch torchaudio pyannote.audio fastapi uvicorn python-multipart modelscope
+
 export MODEL_SOURCE=modelscope
+export MODELSCOPE_CACHE=/data/modelscope_cache
+export CUDA_VISIBLE_DEVICES=4   # or 5 if SenseVoice uses 4 alone
+export PORT=8002                # MeetMemo default DIARIZE_API_URL port
 
-# 3. Patch pyannote's HuggingFace downloader to use local files
-#    (Required because gated models like pyannote/segmentation-3.0
-#     are inaccessible from China without a HF token)
-python3 -c "
-from pathlib import Path
-p = Path.home() / '.local' / 'lib' / 'python3.12' / 'site-packages' / 'pyannote' / 'audio' / 'utils' / 'hf_hub.py'
-content = p.read_text()
-old = '''    if isinstance(token, str) and not token.startswith(\"hf_\"):
-        token = None
+nohup python3 main.py >> server.log 2>&1 &
+curl -s http://127.0.0.1:8002/health
+```
 
-    try:'''
-new = '''    if isinstance(token, str) and not token.startswith(\"hf_\"):
-        token = None
+MeetMemo `.env`:
 
-    # --- MeetMemo patch: redirect gated models to /data/models/pyannote/ ---
-    _local_base = Path(\"/data/models/pyannote\")
-    _gated_ids = {\"pyannote/segmentation-3.0\", \"pyannote/speaker-diarization-3.1\", \"pyannote/speaker-diarization-community-1\"}
-    if model_id in _gated_ids:
-        _fname = asset_file.value if isinstance(asset_file, AssetFileName) else str(asset_file)
-        _local_path = _local_base / model_id.split(\"/\", 1)[-1]
-        if subfolder:
-            _local_path = _local_path / subfolder
-        _local_path = _local_path / _fname
-        if _local_path.exists():
-            import logging
-            logging.getLogger(__name__).info(f\"Using local file for {model_id}/{_fname}\")
-            return str(_local_path)
-    # --- End MeetMemo patch ---
-
-    try:'''
-content = content.replace(old, new, 1)
-p.write_text(content)
-print('hf_hub.py patched')
-"
-
-# 4. Run the server
-python main.py
-# → Listening on http://0.0.0.0:8001
+```env
+DIARIZE_PROVIDER=remote
+DIARIZE_API_URL=http://<ai-server>:8002
+DIARIZE_MERGE_MIN_OVERLAP_SEC=0.3
+DIARIZE_MERGE_MIN_OVERLAP_RATIO=0.05
 ```
 
 ## API
 
-### POST /diarize
+### `POST /diarize`
 
-Send an audio file for speaker diarization.
-
-**Request:** `multipart/form-data` with field `audio`
+**Request:** `multipart/form-data`, field `audio`
 
 **Response (200):**
+
 ```json
 {
-    "speaker_segments": [
-        {"speaker": "SPEAKER_00", "start": 0.0, "end": 2.5},
-        {"speaker": "SPEAKER_01", "start": 2.5, "end": 5.0}
-    ],
-    "num_speakers": 2
+  "speaker_segments": [
+    {"speaker": "SPEAKER_00", "start": 0.0, "end": 2.5}
+  ],
+  "num_speakers": 2
 }
 ```
 
-### GET /health
+### `GET /health`
 
-Health check.
-
-**Response (200):**
 ```json
-{"status": "ok", "device": "cpu", "pipeline_loaded": true}
+{"status": "ok", "device": "cuda", "pipeline_loaded": true}
 ```
 
-## Deployment
-
-The server is deployed on `10.65.37.237:8001`. It runs on CPU because the
-Quadro P2000 (SM 6.1) is incompatible with PyTorch >= 2.8 required by
-pyannote-audio 4.0.4.
-
-### Process management
-
-```bash
-# Check process
-ps aux | grep 'python3 main.py'
-
-# Tail logs
-tail -f ~/diarizer-server/server.log
-
-# Restart
-pkill -f 'python3 main.py'
-cd ~/diarizer-server && nohup python3 main.py > server.log 2>&1 &
-```
-
-## Environment Variables
+## Environment variables
 
 | Variable | Default | Description |
-|---|---|---|
-| `MODEL_SOURCE` | `modelscope` | `huggingface` or `modelscope` |
+|----------|---------|-------------|
+| `MODEL_SOURCE` | `modelscope` | `modelscope` or `huggingface` |
 | `HOST` | `0.0.0.0` | Bind address |
-| `PORT` | `8001` | Listen port |
+| `PORT` | `8001` | Listen port in code default; use **8002** for MeetMemo |
 
-## Known Issues
+> **Note:** `main.py` defaults to port `8001`. Production MeetMemo expects **8002** — set `PORT=8002` when starting.
 
-- **CPU only**: Quadro P2000 (Pascal SM 6.1) is not supported by PyTorch >= 2.8.
-  CPU diarization of a 1-hour meeting takes ~70 minutes.
-- **NO_PROXY parsing bug**: The host has `ALL_PROXY=socks5://...` and
-  `NO_PROXY` with IPv6 addresses. httpx 0.28.1 crashes on this config.
-  The `main.py` strips these vars on startup.
-- **Gated models**: pyannote segmentation and diarization models are gated on
-  HuggingFace. The `hf_hub.py` patch redirects to locally-downloaded
-  (via ModelScope) copies.
+## Gated models & ModelScope
+
+pyannote segmentation models may be gated on HuggingFace. For deployments in China, download via ModelScope and optionally patch `pyannote.audio` `hf_hub.py` to read local files (see historical notes in git history for this repo).
+
+## Process management
+
+```bash
+pkill -f 'diarizer-server' || pkill -f 'diarizer-server/main.py' || true
+cd /data/diarizer-server
+CUDA_VISIBLE_DEVICES=4 PORT=8002 nohup python3 main.py >> server.log 2>&1 &
+tail -f server.log
+```
+
+## GPU sharing with SenseVoice
+
+On a 140GB H20, SenseVoice (~1–3GB idle) and pyannote (~0.5–2GB idle) can share one GPU. Peak usage during diarization of a 10-minute meeting may reach several GB; keep vLLM on **other** GPUs.
+
+See [sensevoice-server/README.md](../sensevoice-server/README.md) for the recommended 8×GPU layout.
