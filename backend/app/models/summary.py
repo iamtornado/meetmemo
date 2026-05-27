@@ -24,6 +24,7 @@ class Summary(Base):
     ai_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_agenda: Mapped[str | None] = mapped_column(Text, nullable=True)
     additional_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    formal_minutes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )

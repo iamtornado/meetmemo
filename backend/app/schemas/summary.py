@@ -39,6 +39,7 @@ class SummaryResponse(BaseModel):
     ai_date: datetime | None
     next_agenda: str | None
     additional_notes: str | None
+    formal_minutes: str | None = None
     created_at: datetime
     updated_at: datetime
     attendees: list[AttendeeSchema] = []

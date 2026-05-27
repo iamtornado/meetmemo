@@ -40,6 +40,9 @@ export interface Meeting {
   error_message: string | null;
   processing_started_at: string | null;
   processing_completed_at: string | null;
+  meeting_location: string | null;
+  host: string | null;
+  recorder_unit: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -106,6 +109,7 @@ export interface Summary {
   ai_date: string | null;
   next_agenda: string | null;
   additional_notes: string | null;
+  formal_minutes: string | null;
   created_at: string;
   updated_at: string;
   attendees: Attendee[];

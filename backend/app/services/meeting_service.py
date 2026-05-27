@@ -101,6 +101,12 @@ class MeetingService:
             meeting.date = body.date
         if body.duration_seconds is not None:
             meeting.duration_seconds = body.duration_seconds
+        if body.meeting_location is not None:
+            meeting.meeting_location = body.meeting_location or None
+        if body.host is not None:
+            meeting.host = body.host or None
+        if body.recorder_unit is not None:
+            meeting.recorder_unit = body.recorder_unit or None
 
         await self.session.flush()
         return meeting

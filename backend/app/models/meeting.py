@@ -32,6 +32,9 @@ class Meeting(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processing_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    meeting_location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    host: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    recorder_unit: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )

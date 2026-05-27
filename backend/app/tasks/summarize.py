@@ -86,12 +86,19 @@ def summarize(self, diarize_result: dict) -> dict:
 
         summary_data = _summarize_transcript(segments, template)
 
+        formal_minutes = ""
+        if settings.FORMAL_MINUTES_ENABLED:
+            formal_minutes = _generate_formal_minutes_for_meeting(
+                meeting_id, segments, summary_data
+            )
+
         logger.info(f"Summary generated: {meeting_id}")
 
         out_segments = [] if diarize_result.get("summary_only") else segments
         return {
             "meeting_id": meeting_id,
             "summary": summary_data,
+            "formal_minutes": formal_minutes,
             "segments": out_segments,
             "summary_only": bool(diarize_result.get("summary_only")),
             "language": diarize_result.get("language"),
@@ -101,17 +108,114 @@ def summarize(self, diarize_result: dict) -> dict:
 
     except Exception as exc:
         logger.error(f"Summarization failed for {meeting_id}: {exc}")
+        summary_only = bool(diarize_result.get("summary_only"))
+        formal_minutes = ""
+        if settings.FORMAL_MINUTES_ENABLED:
+            try:
+                structured = _load_existing_summary_dict(meeting_id) if summary_only else None
+                if structured:
+                    formal_minutes = _generate_formal_minutes_for_meeting(
+                        meeting_id, segments, structured
+                    )
+                elif not summary_only:
+                    formal_minutes = _generate_formal_minutes_for_meeting(
+                        meeting_id, segments, _build_fallback_summary(segments)
+                    )
+            except Exception as fm_exc:
+                logger.warning(f"Formal minutes failed for {meeting_id}: {fm_exc}")
+
+        if summary_only:
+            return {
+                "meeting_id": meeting_id,
+                "formal_minutes": formal_minutes,
+                "segments": [],
+                "summary_only": True,
+                "language": diarize_result.get("language"),
+                "word_count": diarize_result.get("word_count", 0),
+                "duration": diarize_result.get("duration"),
+                "summary_error": str(exc),
+            }
+
         summary_data = _build_fallback_summary(segments)
         return {
             "meeting_id": meeting_id,
             "summary": summary_data,
+            "formal_minutes": formal_minutes,
             "segments": [] if diarize_result.get("summary_only") else segments,
-            "summary_only": bool(diarize_result.get("summary_only")),
+            "summary_only": summary_only,
             "language": diarize_result.get("language"),
             "word_count": diarize_result.get("word_count", 0),
             "duration": diarize_result.get("duration"),
             "summary_error": str(exc),
         }
+
+
+def _load_existing_summary_dict(meeting_id: str) -> dict[str, Any] | None:
+    """Load structured summary from DB for summary-only regenerate on LLM failure."""
+    import uuid
+
+    from app.database import sync_session_factory
+    from app.models.summary import Summary
+
+    with sync_session_factory() as session:
+        summary = (
+            session.query(Summary)
+            .filter(Summary.meeting_id == uuid.UUID(meeting_id))
+            .first()
+        )
+        if not summary or not (summary.ai_title or summary.key_points):
+            return None
+        return {
+            "title": summary.ai_title,
+            "date": summary.ai_date.isoformat() if summary.ai_date else None,
+            "attendees": [
+                {"name": a.name, "speaker_id": a.speaker_id, "is_guest": a.is_guest}
+                for a in summary.attendees
+            ],
+            "key_points": [
+                {"topic": k.topic, "description": k.description}
+                for k in summary.key_points
+            ],
+            "decisions": [
+                {"description": d.description, "made_by": d.made_by, "consensus": d.consensus}
+                for d in summary.decisions
+            ],
+            "action_items": [
+                {"description": a.description, "assignee": a.assignee, "status": a.status}
+                for a in summary.action_items
+            ],
+            "next_agenda": summary.next_agenda,
+            "additional_notes": summary.additional_notes,
+        }
+
+
+def _generate_formal_minutes_for_meeting(
+    meeting_id: str,
+    segments: list[dict],
+    structured_summary: dict[str, Any],
+) -> str:
+    import uuid
+
+    from app.database import sync_session_factory
+    from app.models.meeting import Meeting
+    from app.tasks.formal_minutes import generate_formal_minutes
+
+    with sync_session_factory() as session:
+        meeting = (
+            session.query(Meeting)
+            .filter(Meeting.id == uuid.UUID(meeting_id))
+            .first()
+        )
+        if not meeting:
+            logger.warning(f"Meeting {meeting_id} not found for formal minutes")
+            return ""
+        try:
+            text = generate_formal_minutes(meeting, segments, structured_summary)
+            logger.info(f"Formal minutes generated: {meeting_id}, {len(text)} chars")
+            return text
+        except Exception as exc:
+            logger.error(f"Formal minutes generation failed for {meeting_id}: {exc}")
+            return ""
 
 
 def _summarize_transcript(segments: list[dict], template: str) -> dict[str, Any]:
@@ -158,6 +262,7 @@ def _summarize_map_reduce(segments: list[dict], chunk_size: int) -> dict[str, An
     if len(partials) == 1:
         return _normalize_summary(partials[0])
 
+    logger.info(f"Reduce step: merging {len(partials)} partial summaries via LLM")
     merged = _reduce_summaries_llm(partials)
     if merged:
         return _normalize_summary(merged)

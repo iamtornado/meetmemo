@@ -28,7 +28,12 @@ export default function MeetingDetailPage() {
     queryFn: () => api.getMeeting(meetingId),
   });
 
-  const { data: transcript } = useQuery({
+  const {
+    data: transcript,
+    isLoading: transcriptLoading,
+    isFetching: transcriptFetching,
+    isError: transcriptError,
+  } = useQuery({
     queryKey: ["transcript", meetingId],
     queryFn: () => api.getTranscript(meetingId),
     enabled: meeting?.status === "completed",
@@ -41,6 +46,9 @@ export default function MeetingDetailPage() {
   });
 
   const [processing, setProcessing] = useState(false);
+  const [exportingDocx, setExportingDocx] = useState(false);
+  const [regeneratingSummary, setRegeneratingSummary] = useState(false);
+  const [regenerateMessage, setRegenerateMessage] = useState("");
   const [processError, setProcessError] = useState("");
   const [progressStep, setProgressStep] = useState<string | null>(null);
   const [pipelineActive, setPipelineActive] = useState(false);
@@ -129,11 +137,92 @@ export default function MeetingDetailPage() {
     }
   };
 
+  const summaryPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (summaryPollRef.current) clearInterval(summaryPollRef.current);
+    };
+  }, []);
+
+  const stopSummaryPoll = useCallback(() => {
+    if (summaryPollRef.current) {
+      clearInterval(summaryPollRef.current);
+      summaryPollRef.current = null;
+    }
+  }, []);
+
+  const startSummaryPoll = useCallback(
+    (baselineUpdatedAt: string | undefined) => {
+      stopSummaryPoll();
+      let attempts = 0;
+      const maxAttempts = 120; // ~10 min at 5s interval
+
+      summaryPollRef.current = setInterval(async () => {
+        attempts += 1;
+        try {
+          const next = await api.getSummary(meetingId);
+          queryClient.setQueryData(["summary", meetingId], next);
+          const updated =
+            baselineUpdatedAt &&
+            next.updated_at &&
+            next.updated_at !== baselineUpdatedAt;
+          if (next.formal_minutes || updated) {
+            stopSummaryPoll();
+            setRegeneratingSummary(false);
+            setRegenerateMessage(
+              next.formal_minutes
+                ? "纪要已生成"
+                : "摘要已更新（若仍无纪要，请查看 worker 日志）"
+            );
+            setTimeout(() => setRegenerateMessage(""), 8000);
+          } else if (attempts >= maxAttempts) {
+            stopSummaryPoll();
+            setRegeneratingSummary(false);
+            setProcessError(
+              "生成时间较长仍未完成，请稍后在纪要页刷新查看，或联系管理员查看 worker 日志"
+            );
+          }
+        } catch {
+          /* ignore transient poll errors */
+        }
+      }, 5000);
+    },
+    [meetingId, queryClient, stopSummaryPoll]
+  );
+
   const handleRegenerateSummary = async () => {
-    await api.regenerateSummary(meetingId);
-    setTimeout(() => {
-      queryClient.invalidateQueries({ queryKey: ["summary", meetingId] });
-    }, 10000);
+    setProcessError("");
+    setRegenerateMessage("");
+    setRegeneratingSummary(true);
+    const baselineUpdatedAt = summary?.updated_at;
+    try {
+      await api.regenerateSummary(meetingId);
+      setRegenerateMessage(
+        "已提交后台任务，正在重新生成摘要与会议纪要（长会议约需 5–15 分钟）…"
+      );
+      startSummaryPoll(baselineUpdatedAt);
+    } catch (err: unknown) {
+      setRegeneratingSummary(false);
+      stopSummaryPoll();
+      setProcessError(
+        err instanceof Error ? err.message : "重新生成请求失败，请确认已登录且服务正常"
+      );
+    }
+  };
+
+  const handleUpdateMeetingMeta = async (data: {
+    host?: string | null;
+    recorder_unit?: string | null;
+    meeting_location?: string | null;
+  }) => {
+    const updated = await api.updateMeeting(meetingId, data);
+    queryClient.setQueryData(["meeting", meetingId], updated);
+  };
+
+  const handleExportMinutesDocx = async () => {
+    const base = (meeting?.title || "会议纪要").replace(/[^\w\u4e00-\u9fff\-]+/g, "_");
+    await api.exportFormalMinutesDocx(meetingId, `${base}-纪要.docx`);
   };
 
   const handleSpeakerRename = async (mappings: Record<string, string>) => {
@@ -142,12 +231,24 @@ export default function MeetingDetailPage() {
     queryClient.invalidateQueries({ queryKey: ["summary", meetingId] });
   };
 
+  const handleExportTranscriptDocx = async () => {
+    setExportingDocx(true);
+    try {
+      const base = (meeting?.title || "transcript").replace(/[^\w\u4e00-\u9fff\-]+/g, "_");
+      await api.exportTranscriptDocx(meetingId, `${base}.docx`);
+    } catch (err: unknown) {
+      setProcessError(err instanceof Error ? err.message : "Export failed");
+    } finally {
+      setExportingDocx(false);
+    }
+  };
+
   if (isLoading) return <AppShell><PageLoading /></AppShell>;
   if (!meeting) return <AppShell><div className="text-center py-12 text-gray-500">Meeting not found</div></AppShell>;
 
   const tabs = [
     { id: "transcript", label: "Transcript" },
-    { id: "summary", label: "Summary" },
+    { id: "summary", label: "纪要 / Summary" },
     { id: "audio", label: "Audio" },
   ];
 
@@ -212,11 +313,17 @@ export default function MeetingDetailPage() {
             <TranscriptViewer
               transcript={transcript}
               onSpeakerRename={handleSpeakerRename}
+              onExportDocx={handleExportTranscriptDocx}
+              exportDocxLoading={exportingDocx}
             />
           ) : (
             <div className="text-center py-12 text-gray-500">
               {isProcessing
                 ? "Transcription in progress..."
+                : transcriptLoading || transcriptFetching
+                ? "正在加载转写稿（长会议约需 10–30 秒）…"
+                : transcriptError
+                ? "转写稿加载失败，请刷新页面重试"
                 : meeting.status === "uploaded"
                 ? "Click Process to start transcription"
                 : "No transcript available"}
@@ -228,7 +335,12 @@ export default function MeetingDetailPage() {
           summary ? (
             <SummaryPanel
               summary={summary}
+              meeting={meeting}
+              onUpdateMeeting={handleUpdateMeetingMeta}
               onRegenerate={handleRegenerateSummary}
+              regenerating={regeneratingSummary}
+              regenerateMessage={regenerateMessage}
+              onExportMinutes={handleExportMinutesDocx}
             />
           ) : (
             <div className="text-center py-12 text-gray-500">

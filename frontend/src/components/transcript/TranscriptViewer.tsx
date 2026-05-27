@@ -6,16 +6,20 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Dialog } from "@/components/ui/dialog";
-import { format } from "date-fns";
+import { Download } from "lucide-react";
 
 export function TranscriptViewer({
   transcript,
   onSpeakerRename,
   onSeek,
+  onExportDocx,
+  exportDocxLoading,
 }: {
   transcript: TranscriptType;
   onSpeakerRename?: (mappings: Record<string, string>) => void;
   onSeek?: (time: number) => void;
+  onExportDocx?: () => void;
+  exportDocxLoading?: boolean;
 }) {
   const [showRename, setShowRename] = useState(false);
   const [renameMappings, setRenameMappings] = useState<Record<string, string>>({});
@@ -78,11 +82,24 @@ export function TranscriptViewer({
         <div className="text-sm text-gray-500">
           {transcript.word_count} words · {transcript.language}
         </div>
-        {speakers.size > 0 && onSpeakerRename && (
-          <Button variant="outline" size="sm" onClick={openRenameDialog}>
-            编辑说话人姓名
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          {onExportDocx && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onExportDocx}
+              disabled={exportDocxLoading}
+            >
+              <Download className="h-4 w-4 mr-1" />
+              {exportDocxLoading ? "导出中…" : "导出 Word"}
+            </Button>
+          )}
+          {speakers.size > 0 && onSpeakerRename && (
+            <Button variant="outline" size="sm" onClick={openRenameDialog}>
+              编辑说话人姓名
+            </Button>
+          )}
+        </div>
       </div>
 
       <div className="space-y-2">

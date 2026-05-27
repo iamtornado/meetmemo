@@ -158,7 +158,16 @@ export const api = {
 
   getMeeting: (id: string) => request<Meeting>(`/meetings/${id}`),
 
-  updateMeeting: (id: string, data: { title?: string; date?: string }) =>
+  updateMeeting: (
+    id: string,
+    data: {
+      title?: string;
+      date?: string;
+      meeting_location?: string | null;
+      host?: string | null;
+      recorder_unit?: string | null;
+    }
+  ) =>
     request<Meeting>(`/meetings/${id}`, {
       method: "PUT",
       body: JSON.stringify(data),
@@ -180,9 +189,72 @@ export const api = {
       body: JSON.stringify({ mappings }),
     }),
 
+  exportTranscriptDocx: async (meetingId: string, suggestedFilename?: string) => {
+    const token =
+      typeof window !== "undefined" ? localStorage.getItem("access_token") : null;
+    const headers: Record<string, string> = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    const res = await fetch(`${getApiBase()}/meetings/${meetingId}/transcript/export`, {
+      headers,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new ApiError(err.detail || "Export failed", res.status);
+    }
+    const blob = await res.blob();
+    const disposition = res.headers.get("Content-Disposition") || "";
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const asciiMatch = disposition.match(/filename="([^"]+)"/i);
+    const filename = utf8Match
+      ? decodeURIComponent(utf8Match[1])
+      : asciiMatch?.[1] || suggestedFilename || "transcript.docx";
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+
   // Summary
   getSummary: (meetingId: string) =>
     request<Summary>(`/meetings/${meetingId}/summary`),
+
+  exportFormalMinutesDocx: async (meetingId: string, suggestedFilename?: string) => {
+    const token =
+      typeof window !== "undefined" ? localStorage.getItem("access_token") : null;
+    const headers: Record<string, string> = {};
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    const res = await fetch(
+      `${getApiBase()}/meetings/${meetingId}/summary/minutes/export`,
+      { headers }
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new ApiError(err.detail || "Export failed", res.status);
+    }
+    const blob = await res.blob();
+    const disposition = res.headers.get("Content-Disposition") || "";
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const asciiMatch = disposition.match(/filename="([^"]+)"/i);
+    const filename = utf8Match
+      ? decodeURIComponent(utf8Match[1])
+      : asciiMatch?.[1] || suggestedFilename || "minutes.docx";
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
 
   regenerateSummary: (meetingId: string) =>
     request<{ message: string }>(`/meetings/${meetingId}/summary/regenerate`, {

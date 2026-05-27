@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     SUMMARY_MAX_CHUNK_CHARS: int = 10000
     SUMMARY_MAP_REDUCE_THRESHOLD: int = 12000
 
+    # --- Formal minutes (集团会议纪要) ---
+    DEFAULT_MEETING_HOST: str = "董事长"
+    FORMAL_MINUTES_ENABLED: bool = True
+
     # --- Celery ---
     CELERY_BROKER_URL: str = ""
     CELERY_RESULT_BACKEND: str = ""

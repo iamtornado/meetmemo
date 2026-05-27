@@ -219,6 +219,7 @@ Cache volume: `ml_cache` in Docker Compose.
 | `GET /api/v1/meetings/:id` | Detail + status |
 | `POST /api/v1/meetings/:id/process` | Start pipeline |
 | `GET /api/v1/meetings/:id/transcript` | Transcript |
+| `GET /api/v1/meetings/:id/transcript/export` | Download transcript as Word (.docx) with speaker and timestamps |
 | `GET /api/v1/meetings/:id/summary` | Summary |
 | `POST /api/v1/meetings/:id/summary/regenerate` | Re-run summarization only (no re-transcribe) |
 | `GET /api/v1/search?q=...` | Search |

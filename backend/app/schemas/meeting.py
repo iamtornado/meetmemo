@@ -15,6 +15,9 @@ class MeetingUpdate(BaseModel):
     title: str | None = None
     date: datetime | None = None
     duration_seconds: int | None = None
+    meeting_location: str | None = None
+    host: str | None = None
+    recorder_unit: str | None = None
 
 
 class MeetingResponse(BaseModel):
@@ -31,6 +34,9 @@ class MeetingResponse(BaseModel):
     error_message: str | None
     processing_started_at: datetime | None
     processing_completed_at: datetime | None
+    meeting_location: str | None = None
+    host: str | None = None
+    recorder_unit: str | None = None
     created_at: datetime
     updated_at: datetime
 

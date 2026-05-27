@@ -177,6 +177,15 @@ def _replace_transcript_segments(
         )
 
 
+def _is_degraded_fallback_summary(summary_data: dict) -> bool:
+    notes = (summary_data.get("additional_notes") or "").strip()
+    if notes.startswith("Auto-generated summary ("):
+        return True
+    if not (summary_data.get("title") or "").strip() and len(summary_data.get("key_points") or []) <= 1:
+        return True
+    return False
+
+
 def _populate_summary_children(session: Session, summary: Summary, summary_data: dict) -> None:
     for a in list(summary.attendees):
         session.delete(a)
@@ -278,15 +287,38 @@ def store_results(self, pipeline_result: dict) -> dict:
                 )
 
         summary_data = pipeline_result.get("summary")
-        if summary_data:
+        summary_error = pipeline_result.get("summary_error")
+        existing_summary = (
+            session.query(Summary).filter(Summary.meeting_id == meeting.id).first()
+        )
+
+        # Summary-only regenerate failed: keep existing summary, optionally update minutes.
+        if summary_data is None and existing_summary:
+            new_fm = (pipeline_result.get("formal_minutes") or "").strip()
+            if new_fm:
+                existing_summary.formal_minutes = new_fm
+                existing_summary.updated_at = datetime.now(timezone.utc)
+        # Partial failure: only persist new formal minutes, do not overwrite good summary.
+        elif summary_data and summary_error and existing_summary:
+            new_fm = (pipeline_result.get("formal_minutes") or "").strip()
+            if new_fm:
+                existing_summary.formal_minutes = new_fm
+                existing_summary.updated_at = datetime.now(timezone.utc)
+        elif summary_data and _is_degraded_fallback_summary(summary_data) and existing_summary and existing_summary.ai_title:
+            new_fm = (pipeline_result.get("formal_minutes") or "").strip()
+            if new_fm:
+                existing_summary.formal_minutes = new_fm
+                existing_summary.updated_at = datetime.now(timezone.utc)
+            logger.warning(
+                "Skipping summary overwrite for meeting %s (degraded fallback)",
+                meeting_id,
+            )
+        elif summary_data:
             model_used = f"llm/{pipeline_result.get('summary_model', settings.LLM_MODEL)}"
             ai_date = (
                 datetime.fromisoformat(summary_data["date"])
                 if summary_data.get("date")
                 else None
-            )
-            existing_summary = (
-                session.query(Summary).filter(Summary.meeting_id == meeting.id).first()
             )
             if existing_summary:
                 existing_summary.model_used = model_used
@@ -294,6 +326,9 @@ def store_results(self, pipeline_result: dict) -> dict:
                 existing_summary.ai_date = ai_date
                 existing_summary.next_agenda = summary_data.get("next_agenda")
                 existing_summary.additional_notes = summary_data.get("additional_notes")
+                new_fm = (pipeline_result.get("formal_minutes") or "").strip()
+                if new_fm:
+                    existing_summary.formal_minutes = new_fm
                 existing_summary.updated_at = datetime.now(timezone.utc)
                 _populate_summary_children(session, existing_summary, summary_data)
             else:
@@ -304,6 +339,7 @@ def store_results(self, pipeline_result: dict) -> dict:
                     ai_date=ai_date,
                     next_agenda=summary_data.get("next_agenda"),
                     additional_notes=summary_data.get("additional_notes"),
+                    formal_minutes=pipeline_result.get("formal_minutes"),
                 )
                 session.add(summary)
                 session.flush()
